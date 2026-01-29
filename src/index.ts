@@ -8,7 +8,7 @@ import { userRoutes } from './routes/users.js';
 import { adminRoutes } from './routes/admin.js';
 import { authenticate } from './middleware/auth.js';
 import { requireAdmin, requireIssuerOrAdmin } from './middleware/roleCheck.js';
-import { config } from './config.js';
+import { config } from './config/index.js';
 
 const fastify = Fastify({ logger: true });
 
