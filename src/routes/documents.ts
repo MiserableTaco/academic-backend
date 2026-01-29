@@ -159,7 +159,161 @@ export async function documentRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // Bulk document upload
+  // Smart table bulk upload
+  fastify.post('/bulk-upload-smart', {
+    onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
+  }, async (request, reply) => {
+    const user = request.user as any;
+
+    try {
+      const data = await request.file();
+      if (!data) {
+        return reply.code(400).send({ error: 'No files uploaded' });
+      }
+
+      // This is actually multipart with multiple files and JSON data
+      // We'll receive files and a JSON mapping
+      const parts = request.parts();
+      const files: any[] = [];
+      let mappingData: any = null;
+
+      for await (const part of parts) {
+        if (part.type === 'file' && part.fieldname.startsWith('file_')) {
+          files.push({
+            data: await part.toBuffer(),
+            filename: part.filename,
+            fieldname: part.fieldname
+          });
+        } else if (part.fieldname === 'mapping') {
+          const value = (part as any).value;
+          mappingData = JSON.parse(value);
+        }
+      }
+
+      if (files.length === 0 || !mappingData) {
+        return reply.code(400).send({ error: 'No files or mapping provided' });
+      }
+
+      const institution = await prisma.institution.findUnique({
+        where: { id: user.institutionId }
+      });
+
+      if (!institution) {
+        return reply.code(404).send({ error: 'Institution not found' });
+      }
+
+      const results = {
+        total: mappingData.length,
+        successful: 0,
+        failed: 0,
+        errors: [] as any[]
+      };
+
+      // Process each mapping
+      for (const mapping of mappingData) {
+        try {
+          const { fileIndex, studentEmail, documentType } = mapping;
+
+          if (fileIndex < 0 || fileIndex >= files.length) {
+            results.failed++;
+            results.errors.push({ mapping, error: 'Invalid file index' });
+            continue;
+          }
+
+          // Find recipient
+          const recipient = await prisma.user.findUnique({
+            where: { email: studentEmail.trim() }
+          });
+
+          if (!recipient) {
+            results.failed++;
+            results.errors.push({ mapping, error: `Student not found: ${studentEmail}` });
+            continue;
+          }
+
+          // Check institution match
+          if (user.role === 'ISSUER' && recipient.institutionId !== user.institutionId) {
+            results.failed++;
+            results.errors.push({ mapping, error: `Student not in your institution: ${studentEmail}` });
+            continue;
+          }
+
+          const file = files[fileIndex];
+          const fileBuffer = file.data;
+
+          // Save file
+          const savedFileName = `${crypto.randomUUID()}.pdf`;
+          const uploadsDir = path.join(process.cwd(), 'uploads');
+          await fs.mkdir(uploadsDir, { recursive: true });
+          const filePath = path.join(uploadsDir, savedFileName);
+          await fs.writeFile(filePath, fileBuffer);
+
+          // Sign document
+          const { signature, hash } = KeyManagementService.signDocument(
+            fileBuffer,
+            institution.rootPrivateKey,
+            institution.keyVersion
+          );
+
+          // Create document
+          await prisma.document.create({
+            data: {
+              type: documentType.trim(),
+              userId: recipient.id,
+              institutionId: institution.id,
+              status: 'ACTIVE',
+              metadata: {
+                fileName: savedFileName,
+                fileSize: fileBuffer.length,
+                originalName: file.filename,
+                signature,
+                hash,
+                algorithm: 'RSA-PSS-SHA256',
+                keyVersion: institution.keyVersion,
+                issuerId: user.userId,
+                issuerEmail: user.email
+              }
+            }
+          });
+
+          // Send email notification
+          await EmailService.sendDocumentIssued(
+            recipient.email,
+            documentType.trim(),
+            institution.name
+          );
+
+          results.successful++;
+          console.log(`✅ Smart bulk issued: ${documentType} to ${studentEmail}`);
+
+        } catch (err: any) {
+          results.failed++;
+          results.errors.push({ mapping, error: err.message });
+          console.error(`❌ Smart bulk upload error:`, err);
+        }
+      }
+
+      // Log audit
+      await prisma.auditLog.create({
+        data: {
+          userId: user.userId,
+          action: 'bulk_document_upload_smart',
+          resource: 'Document',
+          details: results,
+          success: true
+        }
+      });
+
+      console.log(`📦 Smart bulk upload complete: ${results.successful}/${results.total} successful`);
+
+      return results;
+    } catch (error: any) {
+      fastify.log.error(error);
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  // CSV+ZIP bulk upload
   fastify.post('/bulk-upload', {
     onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
   }, async (request, reply) => {
