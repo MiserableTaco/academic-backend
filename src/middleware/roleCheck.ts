@@ -13,19 +13,23 @@ export function requireRole(...allowedRoles: string[]) {
         error: `Access denied. Required role: ${allowedRoles.join(' or ')}` 
       });
     }
+    
+    // Continue to next handler
   };
 }
 
-export function requireAdmin(request: FastifyRequest, reply: FastifyReply) {
+export async function requireAdmin(request: FastifyRequest, reply: FastifyReply) {
   const user = request.user as any;
   if (user?.role !== 'ADMIN') {
     return reply.code(403).send({ error: 'Admin access required' });
   }
+  // Continue if admin
 }
 
-export function requireIssuerOrAdmin(request: FastifyRequest, reply: FastifyReply) {
+export async function requireIssuerOrAdmin(request: FastifyRequest, reply: FastifyReply) {
   const user = request.user as any;
   if (user?.role !== 'ISSUER' && user?.role !== 'ADMIN') {
     return reply.code(403).send({ error: 'Issuer or Admin access required' });
   }
+  // Continue if issuer or admin
 }

@@ -6,23 +6,27 @@ export async function adminRoutes(fastify: FastifyInstance) {
   fastify.get('/stats', {
     onRequest: [fastify.authenticate, requireAdmin]
   }, async (request, reply) => {
-    const [totalUsers, totalDocuments, totalInstitutions] = await Promise.all([
-      prisma.user.count(),
-      prisma.document.count(),
-      prisma.institution.count()
-    ]);
+    try {
+      const [totalUsers, totalDocuments, totalInstitutions] = await Promise.all([
+        prisma.user.count(),
+        prisma.document.count(),
+        prisma.institution.count()
+      ]);
 
-    return {
-      totalUsers,
-      totalDocuments,
-      totalInstitutions
-    };
+      return {
+        totalUsers,
+        totalDocuments,
+        totalInstitutions
+      };
+    } catch (error: any) {
+      fastify.log.error(error);
+      return reply.code(500).send({ error: 'Failed to fetch stats' });
+    }
   });
 
   fastify.post('/whitelist', {
     onRequest: [fastify.authenticate, requireAdmin]
   }, async (request, reply) => {
-    const user = request.user as any;
     const { emails, institutionId } = request.body as any;
     
     if (!Array.isArray(emails) || emails.length === 0) {
