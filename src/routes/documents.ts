@@ -1,62 +1,86 @@
 import { FastifyInstance } from 'fastify';
-import { DocumentService } from '../services/document.service.js';
-import { VerificationService } from '../services/verification.service.js';
 import { prisma } from '../lib/prisma.js';
-import { requireIssuerOrAdmin } from '../middleware/roleCheck.js';
+import { KeyManagementService } from '../services/key-management.service.js';
 import { EmailService } from '../services/email.service.js';
+import { VerificationService } from '../services/verification.service.js';
 import path from 'path';
 import fs from 'fs/promises';
+import { createWriteStream } from 'fs';
+import { pipeline } from 'stream/promises';
+import crypto from 'crypto';
+import AdmZip from 'adm-zip';
+import Papa from 'papaparse';
 
 export async function documentRoutes(fastify: FastifyInstance) {
+  // List documents
   fastify.get('/', {
     onRequest: [fastify.authenticate]
   }, async (request) => {
     const user = request.user as any;
+
     const documents = await prisma.document.findMany({
       where: { userId: user.userId },
-      include: { institution: true },
-      orderBy: { issuedAt: 'desc' }
+      include: {
+        institution: true,
+        user: true
+      },
+      orderBy: {
+        issuedAt: 'desc'
+      }
     });
+
     return { documents };
   });
 
+  // Get single document
   fastify.get('/:id', {
     onRequest: [fastify.authenticate]
-  }, async (request) => {
+  }, async (request, reply) => {
     const { id } = request.params as any;
     const user = request.user as any;
-    const document = await DocumentService.getDocument(id, user.userId);
+
+    const document = await prisma.document.findUnique({
+      where: { id },
+      include: {
+        institution: true,
+        user: true
+      }
+    });
+
+    if (!document) {
+      return reply.code(404).send({ error: 'Document not found' });
+    }
+
+    if (document.userId !== user.userId && user.role !== 'ADMIN') {
+      return reply.code(403).send({ error: 'Access denied' });
+    }
+
     return { document };
   });
 
+  // Single document upload
   fastify.post('/upload', {
-    onRequest: [fastify.authenticate, requireIssuerOrAdmin]
+    onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
   }, async (request, reply) => {
     const user = request.user as any;
-    
+
     try {
       const parts = request.parts();
+      let file: any = null;
       let documentType = 'Document';
-      let recipientEmail = user.email; // Default: issue to self
-      let fileData: any = null;
+      let recipientEmail = user.email;
 
       for await (const part of parts) {
-        if (part.type === 'field' && part.fieldname === 'documentType') {
-          documentType = part.value as string;
-        } else if (part.type === 'field' && part.fieldname === 'recipientEmail') {
-          recipientEmail = part.value as string;
-        } else if (part.type === 'file' && part.fieldname === 'file') {
-          if (part.mimetype !== 'application/pdf') {
-            return reply.code(400).send({ error: 'Only PDF files allowed' });
-          }
-          fileData = {
-            buffer: await part.toBuffer(),
-            filename: part.filename
-          };
+        if (part.type === 'file') {
+          file = part;
+        } else if (part.fieldname === 'documentType') {
+          documentType = (part as any).value;
+        } else if (part.fieldname === 'recipientEmail') {
+          recipientEmail = (part as any).value;
         }
       }
 
-      if (!fileData) {
+      if (!file) {
         return reply.code(400).send({ error: 'No file uploaded' });
       }
 
@@ -66,62 +90,353 @@ export async function documentRoutes(fastify: FastifyInstance) {
       });
 
       if (!recipient) {
-        return reply.code(400).send({ error: 'Recipient not found' });
+        return reply.code(404).send({ error: `Recipient not found: ${recipientEmail}` });
       }
 
-      const document = await DocumentService.uploadDocument(
-        user.userId,
-        recipient.id,
-        fileData.buffer,
-        fileData.filename,
-        documentType
+      // Check institution match
+      if (user.role === 'ISSUER' && recipient.institutionId !== user.institutionId) {
+        return reply.code(403).send({ error: 'Can only issue to students in your institution' });
+      }
+
+      const institution = await prisma.institution.findUnique({
+        where: { id: user.institutionId }
+      });
+
+      if (!institution) {
+        return reply.code(404).send({ error: 'Institution not found' });
+      }
+
+      const fileName = `${crypto.randomUUID()}.pdf`;
+      const uploadsDir = path.join(process.cwd(), 'uploads');
+      await fs.mkdir(uploadsDir, { recursive: true });
+
+      const filePath = path.join(uploadsDir, fileName);
+      await pipeline(file.file, createWriteStream(filePath));
+
+      const fileBuffer = await fs.readFile(filePath);
+      const { signature, hash } = KeyManagementService.signDocument(
+        fileBuffer,
+        institution.rootPrivateKey,
+        institution.keyVersion
       );
 
-      // Send email notification
+      const document = await prisma.document.create({
+        data: {
+          type: documentType,
+          userId: recipient.id,
+          institutionId: institution.id,
+          status: 'ACTIVE',
+          metadata: {
+            fileName,
+            fileSize: fileBuffer.length,
+            originalName: file.filename,
+            signature,
+            hash,
+            algorithm: 'RSA-PSS-SHA256',
+            keyVersion: institution.keyVersion,
+            issuerId: user.userId,
+            issuerEmail: user.email
+          }
+        },
+        include: {
+          institution: true,
+          user: true
+        }
+      });
+
       await EmailService.sendDocumentIssued(
         recipient.email,
         documentType,
-        document.institution.name
+        institution.name
       );
+
+      console.log(`📥 Document uploaded: ${documentType} for ${recipient.email}`);
 
       return { document };
     } catch (error: any) {
       fastify.log.error(error);
-      if (error.statusCode === 413 || error.code === 'FST_REQ_FILE_TOO_LARGE') {
-        return reply.code(413).send({ error: 'File too large (max 50MB)' });
-      }
-      return reply.code(500).send({ error: error.message || 'Upload failed' });
+      return reply.code(500).send({ error: error.message });
     }
   });
 
+  // Bulk document upload
+  fastify.post('/bulk-upload', {
+    onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
+  }, async (request, reply) => {
+    const user = request.user as any;
+
+    try {
+      const parts = request.parts();
+      let zipFile: any = null;
+      let csvFile: any = null;
+
+      for await (const part of parts) {
+        if (part.type === 'file') {
+          if (part.fieldname === 'zipFile') {
+            zipFile = part;
+          } else if (part.fieldname === 'csvFile') {
+            csvFile = part;
+          }
+        }
+      }
+
+      if (!zipFile || !csvFile) {
+        return reply.code(400).send({ error: 'Both ZIP and CSV files are required' });
+      }
+
+      // Save ZIP temporarily
+      const tempZipPath = path.join(process.cwd(), 'uploads', `temp-${crypto.randomUUID()}.zip`);
+      await pipeline(zipFile.file, createWriteStream(tempZipPath));
+
+      // Read CSV
+      const csvBuffer = await csvFile.toBuffer();
+      const csvText = csvBuffer.toString('utf-8');
+
+      const parsed = Papa.parse(csvText, {
+        header: true,
+        skipEmptyLines: true
+      });
+
+      // Extract ZIP
+      const zip = new AdmZip(tempZipPath);
+      const zipEntries = zip.getEntries();
+
+      const results = {
+        total: 0,
+        successful: 0,
+        failed: 0,
+        errors: [] as any[]
+      };
+
+      const institution = await prisma.institution.findUnique({
+        where: { id: user.institutionId }
+      });
+
+      if (!institution) {
+        return reply.code(404).send({ error: 'Institution not found' });
+      }
+
+      // Process each row
+      for (const row of parsed.data as any[]) {
+        results.total++;
+
+        try {
+          const { filename, studentEmail, documentType } = row;
+
+          if (!filename || !studentEmail || !documentType) {
+            results.failed++;
+            results.errors.push({ row, error: 'Missing required fields' });
+            continue;
+          }
+
+          // Find student
+          const recipient = await prisma.user.findUnique({
+            where: { email: studentEmail.trim() }
+          });
+
+          if (!recipient) {
+            results.failed++;
+            results.errors.push({ row, error: `Student not found: ${studentEmail}` });
+            continue;
+          }
+
+          // Check institution match
+          if (user.role === 'ISSUER' && recipient.institutionId !== user.institutionId) {
+            results.failed++;
+            results.errors.push({ row, error: `Student not in your institution: ${studentEmail}` });
+            continue;
+          }
+
+          // Find file in ZIP
+          const zipEntry = zipEntries.find(entry => entry.entryName === filename.trim());
+
+          if (!zipEntry) {
+            results.failed++;
+            results.errors.push({ row, error: `File not found in ZIP: ${filename}` });
+            continue;
+          }
+
+          // Extract file
+          const fileBuffer = zipEntry.getData();
+
+          if (!fileBuffer || fileBuffer.length === 0) {
+            results.failed++;
+            results.errors.push({ row, error: `Could not read file: ${filename}` });
+            continue;
+          }
+
+          // Save file
+          const savedFileName = `${crypto.randomUUID()}.pdf`;
+          const uploadsDir = path.join(process.cwd(), 'uploads');
+          await fs.mkdir(uploadsDir, { recursive: true });
+          const filePath = path.join(uploadsDir, savedFileName);
+          await fs.writeFile(filePath, fileBuffer);
+
+          // Sign document
+          const { signature, hash } = KeyManagementService.signDocument(
+            fileBuffer,
+            institution.rootPrivateKey,
+            institution.keyVersion
+          );
+
+          // Create document
+          await prisma.document.create({
+            data: {
+              type: documentType.trim(),
+              userId: recipient.id,
+              institutionId: institution.id,
+              status: 'ACTIVE',
+              metadata: {
+                fileName: savedFileName,
+                fileSize: fileBuffer.length,
+                originalName: filename,
+                signature,
+                hash,
+                algorithm: 'RSA-PSS-SHA256',
+                keyVersion: institution.keyVersion,
+                issuerId: user.userId,
+                issuerEmail: user.email
+              }
+            }
+          });
+
+          // Send email notification
+          await EmailService.sendDocumentIssued(
+            recipient.email,
+            documentType.trim(),
+            institution.name
+          );
+
+          results.successful++;
+          console.log(`✅ Bulk issued: ${documentType} to ${studentEmail}`);
+
+        } catch (err: any) {
+          results.failed++;
+          results.errors.push({ row, error: err.message });
+          console.error(`❌ Bulk upload error:`, err);
+        }
+      }
+
+      // Cleanup temp ZIP
+      try {
+        await fs.unlink(tempZipPath);
+      } catch (err) {
+        console.warn('Could not delete temp ZIP:', err);
+      }
+
+      // Log audit
+      await prisma.auditLog.create({
+        data: {
+          userId: user.userId,
+          action: 'bulk_document_upload',
+          resource: 'Document',
+          details: results,
+          success: true
+        }
+      });
+
+      console.log(`📦 Bulk upload complete: ${results.successful}/${results.total} successful`);
+
+      return results;
+    } catch (error: any) {
+      fastify.log.error(error);
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  // Download document
+  fastify.get('/:id/download', {
+    onRequest: [fastify.authenticate]
+  }, async (request, reply) => {
+    const { id } = request.params as any;
+    const user = request.user as any;
+
+    const document = await prisma.document.findUnique({
+      where: { id }
+    });
+
+    if (!document) {
+      return reply.code(404).send({ error: 'Document not found' });
+    }
+
+    if (document.userId !== user.userId && user.role !== 'ADMIN') {
+      return reply.code(403).send({ error: 'Access denied' });
+    }
+
+    const metadata = document.metadata as any;
+    const filePath = path.join(process.cwd(), 'uploads', metadata.fileName);
+
+    try {
+      const file = await fs.readFile(filePath);
+      const originalName = metadata.originalName || 'document.pdf';
+      const encodedFilename = encodeURIComponent(originalName);
+
+      reply
+        .header('Content-Type', 'application/pdf')
+        .header('Content-Disposition', `attachment; filename="${originalName}"; filename*=UTF-8''${encodedFilename}`)
+        .send(file);
+    } catch (error) {
+      return reply.code(404).send({ error: 'File not found' });
+    }
+  });
+
+  // Verify document
+  fastify.post('/:id/verify', {
+    onRequest: [fastify.authenticate]
+  }, async (request, reply) => {
+    const { id } = request.params as any;
+
+    const document = await prisma.document.findUnique({
+      where: { id }
+    });
+
+    if (!document) {
+      return reply.code(404).send({ error: 'Document not found' });
+    }
+
+    const metadata = document.metadata as any;
+    const filePath = path.join(process.cwd(), 'uploads', metadata.fileName);
+
+    try {
+      const fileBuffer = await fs.readFile(filePath);
+      const result = await VerificationService.verifyDocument(id, fileBuffer);
+      return result;
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  // Delete document
   fastify.delete('/:id', {
-    onRequest: [fastify.authenticate, requireIssuerOrAdmin]
+    onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
   }, async (request, reply) => {
     const { id } = request.params as any;
     const user = request.user as any;
 
     try {
       const document = await prisma.document.findUnique({
-        where: { id },
-        include: { user: true }
+        where: { id }
       });
 
       if (!document) {
         return reply.code(404).send({ error: 'Document not found' });
       }
 
-      if (user.role === 'ISSUER' && document.institutionId !== user.institutionId) {
-        return reply.code(403).send({ error: 'You can only delete documents from your institution' });
+      if (user.role === 'ISSUER') {
+        const metadata = document.metadata as any;
+        if (metadata.issuerId !== user.userId) {
+          return reply.code(403).send({ error: 'Can only delete documents you issued' });
+        }
       }
 
       const metadata = document.metadata as any;
       const filePath = path.join(process.cwd(), 'uploads', metadata.fileName);
-      
+
       try {
         await fs.unlink(filePath);
-        console.log('🗑️ Deleted file:', metadata.fileName);
+        console.log('🗑️  Deleted file:', metadata.fileName);
       } catch (err) {
-        console.warn('⚠️ File already deleted:', metadata.fileName);
+        console.warn('⚠️  File already deleted:', metadata.fileName);
       }
 
       await prisma.document.delete({ where: { id } });
@@ -130,127 +445,7 @@ export async function documentRoutes(fastify: FastifyInstance) {
 
       return { message: 'Document deleted successfully' };
     } catch (error: any) {
-      console.error('❌ Delete error:', error);
-      return reply.code(500).send({ error: error.message });
-    }
-  });
-
-  fastify.get('/:id/download', async (request, reply) => {
-    const { id } = request.params as any;
-    const query = request.query as any;
-    
-    let userId: string;
-    
-    if (query.token) {
-      try {
-        const decoded = await fastify.jwt.verify(query.token) as any;
-        userId = decoded.userId;
-      } catch (err) {
-        return reply.code(401).send({ error: 'Invalid token' });
-      }
-    } else {
-      try {
-        await request.jwtVerify();
-        const user = request.user as any;
-        userId = user.userId;
-      } catch (err) {
-        return reply.code(401).send({ error: 'Unauthorized' });
-      }
-    }
-    
-    try {
-      const document = await prisma.document.findUnique({
-        where: { id },
-        include: { user: true }
-      });
-
-      if (!document || document.userId !== userId) {
-        return reply.code(404).send({ error: 'Document not found' });
-      }
-
-      const metadata = document.metadata as any;
-      const filePath = path.join(process.cwd(), 'uploads', metadata.fileName);
-      const fileBuffer = await fs.readFile(filePath);
-
-      const originalName = metadata.originalName || 'document.pdf';
-      const encodedFilename = encodeURIComponent(originalName);
-      
-      return reply
-        .header('Access-Control-Allow-Origin', 'http://localhost:3001')
-        .header('Access-Control-Allow-Credentials', 'true')
-        .header('Content-Type', 'application/pdf')
-        .header('Content-Disposition', `attachment; filename*=UTF-8''${encodedFilename}`)
-        .send(fileBuffer);
-        
-    } catch (error: any) {
-      console.error('❌ Download error:', error.message);
-      return reply.code(404).send({ error: error.message });
-    }
-  });
-
-  fastify.post('/:id/verify', async (request, reply) => {
-    const { id } = request.params as any;
-    
-    try {
-      const document = await prisma.document.findUnique({
-        where: { id }
-      });
-
-      if (!document) {
-        return reply.code(404).send({ error: 'Document not found' });
-      }
-
-      const metadata = document.metadata as any;
-      const filePath = path.join(process.cwd(), 'uploads', metadata.fileName);
-      const fileBuffer = await fs.readFile(filePath);
-
-      const result = await VerificationService.verifyDocument(id, fileBuffer);
-
-      return result;
-    } catch (error: any) {
-      return reply.code(500).send({ error: error.message });
-    }
-  });
-
-  // Revoke document
-  fastify.post('/:id/revoke', {
-    onRequest: [fastify.authenticate, requireIssuerOrAdmin]
-  }, async (request, reply) => {
-    const { id } = request.params as any;
-    const { reason } = request.body as any;
-    const user = request.user as any;
-
-    try {
-      const document = await prisma.document.findUnique({
-        where: { id }
-      });
-
-      if (!document) {
-        return reply.code(404).send({ error: 'Document not found' });
-      }
-
-      if (user.role === 'ISSUER' && document.institutionId !== user.institutionId) {
-        return reply.code(403).send({ error: 'Can only revoke documents from your institution' });
-      }
-
-      // Update document status
-      await prisma.document.update({
-        where: { id },
-        data: { status: 'REVOKED' }
-      });
-
-      // Create revocation record (persists even if document deleted)
-      await prisma.revocation.create({
-        data: {
-          documentId: id,
-          institutionId: document.institutionId,
-          reason: reason || 'No reason provided',
-          revokedBy: user.email
-        }
-      });
-
-      return { message: 'Document revoked successfully' };
-    } catch (error: any) {
+      fastify.log.error(error);
       return reply.code(500).send({ error: error.message });
     }
   });
