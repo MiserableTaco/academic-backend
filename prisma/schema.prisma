@@ -1,0 +1,106 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Institution {
+  id           String   @id @default(cuid())
+  name         String
+  emailDomain  String   @unique
+  publicKey    String
+  privateKey   String
+  status       InstitutionStatus @default(ACTIVE)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  users        User[]
+  documents    Document[]
+}
+
+enum InstitutionStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  institutionId   String
+  role            UserRole  @default(STUDENT)
+  verified        Boolean   @default(false)
+  linkedinUrl     String?
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  institution     Institution @relation(fields: [institutionId], references: [id])
+  documents       Document[]
+  otpVerifications OTPVerification[]
+  devices         Device[]
+  accessLogs      AccessLog[]
+}
+
+enum UserRole {
+  STUDENT
+  ISSUER
+  ADMIN
+}
+
+model OTPVerification {
+  id        String   @id @default(cuid())
+  userId    String
+  email     String
+  code      String
+  attempts  Int      @default(0)
+  verified  Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model Document {
+  id            String   @id @default(cuid())
+  userId        String
+  institutionId String
+  type          String
+  status        DocumentStatus @default(ACTIVE)
+  issuedAt      DateTime
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  user          User     @relation(fields: [userId], references: [id])
+  institution   Institution @relation(fields: [institutionId], references: [id])
+}
+
+enum DocumentStatus {
+  ACTIVE
+  REVOKED
+}
+
+model Device {
+  id        String   @id @default(cuid())
+  userId    String
+  name      String
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model AccessLog {
+  id        String       @id @default(cuid())
+  actorId   String
+  action    AccessAction
+  ipAddress String
+  metadata  Json?
+  createdAt DateTime     @default(now())
+  actor     User         @relation(fields: [actorId], references: [id])
+}
+
+enum AccessAction {
+  OTP_REQUEST
+  OTP_VERIFY
+  DOCUMENT_VIEW
+  DOCUMENT_ISSUE
+}
