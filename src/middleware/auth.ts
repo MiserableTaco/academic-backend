@@ -4,6 +4,6 @@ export async function authenticate(request: FastifyRequest, reply: FastifyReply)
   try {
     await request.jwtVerify();
   } catch (err) {
-    reply.code(401).send({ error: 'Unauthorized' });
+    return reply.code(401).send({ error: 'Unauthorized - Invalid or expired token' });
   }
 }

@@ -1,22 +1,29 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../lib/prisma.js';
+import { requireIssuerOrAdmin } from '../middleware/roleCheck.js';
 
 export async function userRoutes(fastify: FastifyInstance) {
-  fastify.patch('/profile', {
-    onRequest: [fastify.authenticate]
-  }, async (request, reply) => {
+  // Get students from same institution
+  fastify.get('/students', {
+    onRequest: [fastify.authenticate, requireIssuerOrAdmin]
+  }, async (request) => {
     const user = request.user as any;
-    const { linkedinUrl } = request.body as any;
-
-    if (linkedinUrl && !linkedinUrl.startsWith('https://linkedin.com/') && !linkedinUrl.startsWith('https://www.linkedin.com/')) {
-      return reply.code(400).send({ error: 'Invalid LinkedIn URL' });
-    }
-
-    const updated = await prisma.user.update({
-      where: { id: user.userId },
-      data: { linkedinUrl }
+    
+    const students = await prisma.user.findMany({
+      where: {
+        institutionId: user.institutionId,
+        role: 'STUDENT',
+        revokedAt: null
+      },
+      select: {
+        id: true,
+        email: true
+      },
+      orderBy: {
+        email: 'asc'
+      }
     });
 
-    return { linkedinUrl: updated.linkedinUrl };
+    return { students };
   });
 }

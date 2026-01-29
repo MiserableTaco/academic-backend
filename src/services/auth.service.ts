@@ -1,84 +1,96 @@
-import crypto from 'crypto';
 import { prisma } from '../lib/prisma.js';
-import { AccessAction } from '@prisma/client';
 import { EmailService } from './email.service.js';
-
-const OTP_EXPIRY_MS = 3 * 60 * 1000;
+import crypto from 'crypto';
 
 export class AuthService {
-  static async requestOTP(email: string, ip = '0.0.0.0') {
-    const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
-      include: { institution: true }
+  static async requestOTP(email: string): Promise<void> {
+    const normalizedEmail = email.toLowerCase().trim();
+
+    let user = await prisma.user.findUnique({
+      where: { email: normalizedEmail }
     });
 
-    if (!user || user.institution.status !== 'ACTIVE') {
-      throw new Error('Invalid email or institution inactive');
+    if (!user) {
+      const domain = normalizedEmail.split('@')[1];
+      
+      const institution = await prisma.institution.findFirst({
+        where: { emailDomain: domain }
+      });
+
+      if (!institution) {
+        throw new Error('No institution found for this email domain');
+      }
+
+      user = await prisma.user.create({
+        data: {
+          email: normalizedEmail,
+          institutionId: institution.id,
+          role: 'STUDENT',
+          verified: false
+        }
+      });
+    }
+
+    if (user.revokedAt) {
+      throw new Error('User access has been revoked');
     }
 
     const code = crypto.randomInt(100000, 999999).toString();
-    
-    await prisma.oTPVerification.updateMany({
-      where: { userId: user.id, verified: false },
-      data: { expiresAt: new Date(0) }
+    const expiresAt = new Date(Date.now() + 3 * 60 * 1000);
+
+    await prisma.oTPCode.deleteMany({
+      where: { userId: user.id }
     });
 
-    await prisma.oTPVerification.create({
+    await prisma.oTPCode.create({
       data: {
         userId: user.id,
-        email: email.toLowerCase(),
         code,
-        expiresAt: new Date(Date.now() + OTP_EXPIRY_MS)
+        expiresAt
       }
     });
 
-    await prisma.accessLog.create({
-      data: { actorId: user.id, action: AccessAction.OTP_REQUEST, ipAddress: ip, metadata: { email } }
-    });
-
-    await EmailService.sendOTP(email, code);
+    await EmailService.sendOTP(normalizedEmail, code);
   }
 
-  static async verifyOTP(email: string, code: string, ip = '0.0.0.0') {
+  static async verifyOTP(email: string, code: string) {
+    const normalizedEmail = email.toLowerCase().trim();
+
     const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
-      include: { institution: true, devices: { where: { revoked: false } } }
+      where: { email: normalizedEmail },
+      include: { institution: true }
     });
 
-    if (!user) throw new Error('Invalid email or code');
+    if (!user) {
+      throw new Error('User not found');
+    }
 
-    const otp = await prisma.oTPVerification.findFirst({
-      where: { userId: user.id, code, verified: false },
-      orderBy: { createdAt: 'desc' }
+    const otp = await prisma.oTPCode.findFirst({
+      where: {
+        userId: user.id,
+        code,
+        expiresAt: { gte: new Date() }
+      }
     });
 
-    if (!otp) throw new Error('Invalid code');
-    if (otp.expiresAt < new Date()) throw new Error('Code expired (3 min limit)');
-    if (otp.attempts >= 5) throw new Error('Too many attempts');
+    if (!otp) {
+      throw new Error('Invalid or expired code');
+    }
 
-    await prisma.oTPVerification.update({
-      where: { id: otp.id },
-      data: { verified: true }
+    await prisma.oTPCode.delete({
+      where: { id: otp.id }
     });
 
     await prisma.user.update({
       where: { id: user.id },
-      data: { verified: true, lastLoginAt: new Date() }
+      data: { verified: true }
     });
 
     return {
-      user: {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        institutionId: user.institutionId,
-        institutionName: user.institution.name
-      },
-      requiresDeviceRegistration: user.devices.length === 0
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      institutionId: user.institutionId
     };
-  }
-
-  static generateJWTPayload(user: any) {
-    return { userId: user.id, email: user.email, role: user.role, institutionId: user.institutionId };
   }
 }
