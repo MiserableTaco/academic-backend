@@ -13,8 +13,11 @@ import { config } from './config/index.js';
 const fastify = Fastify({ logger: true });
 
 await fastify.register(cors, {
-  origin: ['http://localhost:3001'],
-  credentials: true
+  origin: [
+    'http://localhost:3001',
+  ],
+  credentials: true,
+  exposedHeaders: ['Content-Disposition']
 });
 
 await fastify.register(jwt, { secret: config.jwtSecret });

@@ -4,7 +4,6 @@ import { prisma } from '../lib/prisma.js';
 import { requireIssuerOrAdmin } from '../middleware/roleCheck.js';
 import path from 'path';
 import fs from 'fs/promises';
-import crypto from 'crypto';
 
 export async function documentRoutes(fastify: FastifyInstance) {
   fastify.get('/', {
@@ -138,14 +137,38 @@ export async function documentRoutes(fastify: FastifyInstance) {
     }
     
     try {
-      const { buffer, fileName } = await DocumentService.getDocumentFile(id, userId);
+      const document = await prisma.document.findUnique({
+        where: { id },
+        include: { user: true }
+      });
+
+      if (!document || document.userId !== userId) {
+        return reply.code(404).send({ error: 'Document not found' });
+      }
+
+      const metadata = document.metadata as any;
+      const filePath = path.join(process.cwd(), 'uploads', metadata.fileName);
+      const fileBuffer = await fs.readFile(filePath);
+
+      // Get original filename (supports Chinese characters)
+      const originalName = metadata.originalName || 'document.pdf';
+      
+      // Encode filename for Chinese/Unicode support (RFC 5987)
+      const encodedFilename = encodeURIComponent(originalName);
+      
+      console.log('📥 Download request:', {
+        documentId: id,
+        originalName,
+        encodedFilename,
+        fileSize: fileBuffer.length
+      });
       
       return reply
         .header('Access-Control-Allow-Origin', 'http://localhost:3001')
         .header('Access-Control-Allow-Credentials', 'true')
         .header('Content-Type', 'application/pdf')
-        .header('Content-Disposition', `attachment; filename="${fileName}"`)
-        .send(buffer);
+        .header('Content-Disposition', `attachment; filename*=UTF-8''${encodedFilename}`)
+        .send(fileBuffer);
         
     } catch (error: any) {
       console.error('❌ Download error:', error.message);
