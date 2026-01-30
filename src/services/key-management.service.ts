@@ -10,32 +10,30 @@ export class KeyManagementService {
       publicKeyEncoding: { type: 'spki', format: 'pem' },
       privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
     });
-
     return { publicKey, privateKey };
   }
 
   static encryptPrivateKey(privateKey: string): string {
     const iv = crypto.randomBytes(16);
     const key = crypto.scryptSync(this.MASTER_KEY, 'salt', 32);
-    const cipher = crypto.createCipheriv(this.ALGORITHM as any, key, iv);
+    const cipher = crypto.createCipheriv(this.ALGORITHM, key, iv);
     
     let encrypted = cipher.update(privateKey, 'utf8', 'hex');
     encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag();
     
-    const authTag = (cipher as any).getAuthTag();
-    
+    // Format: iv:authTag:encrypted
     return `${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted}`;
   }
 
   static decryptPrivateKey(encryptedKey: string): string {
-    const [ivHex, authTagHex, encrypted] = encryptedKey.split(':');
+    // Format: iv:authTag:encrypted (colon-separated)
+    const [iv, authTag, encrypted] = encryptedKey.split(':');
     
-    const iv = Buffer.from(ivHex, 'hex');
-    const authTag = Buffer.from(authTagHex, 'hex');
     const key = crypto.scryptSync(this.MASTER_KEY, 'salt', 32);
+    const decipher = crypto.createDecipheriv(this.ALGORITHM, key, Buffer.from(iv, 'hex'));
     
-    const decipher = crypto.createDecipheriv(this.ALGORITHM as any, key, iv);
-    (decipher as any).setAuthTag(authTag);
+    decipher.setAuthTag(Buffer.from(authTag, 'hex'));
     
     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
@@ -43,40 +41,30 @@ export class KeyManagementService {
     return decrypted;
   }
 
-  static signDocument(fileBuffer: Buffer, encryptedPrivateKey: string, keyVersion: number): { signature: string; hash: string } {
-    const privateKey = this.decryptPrivateKey(encryptedPrivateKey);
-    
-    const hash = crypto.createHash('sha256').update(fileBuffer).digest();
-    
-    const signature = crypto.sign(null, hash, {
-      key: privateKey,
-      padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-      saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST
-    });
-    
-    return {
-      signature: signature.toString('base64'),
-      hash: hash.toString('hex')
-    };
+  static hashDocument(fileBuffer: Buffer): string {
+    return crypto.createHash('sha256').update(fileBuffer).digest('hex');
   }
 
-  static verifyDocument(fileBuffer: Buffer, signatureBase64: string, publicKey: string): boolean {
-    try {
-      const hash = crypto.createHash('sha256').update(fileBuffer).digest();
-      const signature = Buffer.from(signatureBase64, 'base64');
-      
-      return crypto.verify(
-        null,
-        hash,
-        {
-          key: publicKey,
-          padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-          saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST
-        },
-        signature
-      );
-    } catch (error) {
+  static signDocument(hash: string, encryptedPrivateKey: string, encryptionKey: string): string {
+    const privateKey = this.decryptPrivateKey(encryptedPrivateKey);
+    
+    const sign = crypto.createSign('RSA-SHA256');
+    sign.update(hash);
+    const signature = sign.sign(privateKey, 'base64');
+    
+    return signature;
+  }
+
+  static verifyDocument(fileBuffer: Buffer, signatureBase64: string, publicKey: string, expectedHash: string): boolean {
+    const actualHash = this.hashDocument(fileBuffer);
+    
+    if (actualHash !== expectedHash) {
       return false;
     }
+    
+    const verify = crypto.createVerify('RSA-SHA256');
+    verify.update(expectedHash);
+    
+    return verify.verify(publicKey, signatureBase64, 'base64');
   }
 }

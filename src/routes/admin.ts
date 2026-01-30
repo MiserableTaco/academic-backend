@@ -1,201 +1,312 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../lib/prisma.js';
-import { requireAdmin } from '../middleware/roleCheck.js';
-import Papa from 'papaparse';
-import path from 'path';
 import fs from 'fs/promises';
+import path from 'path';
+import { parse } from 'csv-parse/sync';
 
 export async function adminRoutes(fastify: FastifyInstance) {
-  // Get stats
   fastify.get('/stats', {
-    onRequest: [fastify.authenticate, requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
   }, async () => {
-    const [userCount, documentCount, institutionCount, recentAuditCount] = await Promise.all([
+    const [users, documents, institutions, recentAudits] = await Promise.all([
       prisma.user.count(),
       prisma.document.count(),
       prisma.institution.count(),
       prisma.auditLog.count({
         where: {
           createdAt: {
-            gte: new Date(Date.now() - 24 * 60 * 60 * 1000)
+            gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
           }
         }
       })
     ]);
 
-    return {
-      users: userCount,
-      documents: documentCount,
-      institutions: institutionCount,
-      recentAudits: recentAuditCount
+    return { 
+      totalUsers: users, 
+      totalDocuments: documents, 
+      totalInstitutions: institutions, 
+      recentAudits 
     };
-  });
+ });
 
-  // Get all users
   fastify.get('/users', {
-    onRequest: [fastify.authenticate, requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
   }, async () => {
     const users = await prisma.user.findMany({
       include: {
         institution: true
       },
-      orderBy: {
-        createdAt: 'desc'
-      }
+      orderBy: { createdAt: 'desc' }
     });
 
     return { users };
   });
 
-  // Get all documents
   fastify.get('/documents', {
-    onRequest: [fastify.authenticate, requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
   }, async () => {
     const documents = await prisma.document.findMany({
       include: {
         user: true,
         institution: true
       },
-      orderBy: {
-        issuedAt: 'desc'
-      }
+      orderBy: { createdAt: 'desc' }
     });
 
     return { documents };
   });
 
-  // Get all institutions
   fastify.get('/institutions', {
-    onRequest: [fastify.authenticate, requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
   }, async () => {
     const institutions = await prisma.institution.findMany({
-      orderBy: {
-        createdAt: 'desc'
-      }
+      orderBy: { createdAt: 'desc' }
     });
 
     return { institutions };
   });
 
-  // Get audit logs
   fastify.get('/audit-logs', {
-    onRequest: [fastify.authenticate, requireAdmin]
-  }, async (request) => {
-    const { limit = 100 } = request.query as any;
-
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
+  }, async () => {
     const logs = await prisma.auditLog.findMany({
       include: {
-        user: {
-          select: {
-            email: true,
-            role: true
-          }
-        }
+        user: true
       },
-      orderBy: {
-        createdAt: 'desc'
-      },
-      take: parseInt(limit)
+      orderBy: { createdAt: 'desc' },
+      take: 100
     });
 
     return { logs };
   });
 
-  // Get security events
   fastify.get('/security-events', {
-    onRequest: [fastify.authenticate, requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
   }, async () => {
     const events = await prisma.auditLog.findMany({
       where: {
-        OR: [
-          { success: false },
-          { action: { contains: 'failed' } },
-          { action: { contains: 'revoke' } }
-        ]
-      },
-      include: {
-        user: {
-          select: {
-            email: true,
-            role: true
-          }
+        success: false,
+        action: {
+          in: ['login_failed', 'unauthorized_access']
         }
       },
-      orderBy: {
-        createdAt: 'desc'
+      include: {
+        user: true
       },
+      orderBy: { createdAt: 'desc' },
       take: 50
     });
 
     return { events };
   });
 
-  // Delete user
-  fastify.delete('/users/:id', {
-    onRequest: [fastify.authenticate, requireAdmin]
-  }, async (request, reply) => {
-    const { id } = request.params as any;
-    const adminUser = request.user as any;
+  fastify.get('/health', {
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
+  }, async () => {
+    const uploadsDir = path.join(process.cwd(), 'uploads');
+    
+    let fileCount = 0;
+    let totalSize = 0;
 
     try {
-      const user = await prisma.user.findUnique({
-        where: { id },
-        include: {
-          documents: true
-        }
-      });
-
-      if (!user) {
-        return reply.code(404).send({ error: 'User not found' });
-      }
-
-      // Prevent deleting yourself
-      if (user.id === adminUser.userId) {
-        return reply.code(400).send({ error: 'Cannot delete your own account' });
-      }
-
-      // Delete associated documents first
-      for (const doc of user.documents) {
-        const metadata = doc.metadata as any;
-        const filePath = path.join(process.cwd(), 'uploads', metadata.fileName);
-        
+      await fs.access(uploadsDir);
+      const files = await fs.readdir(uploadsDir);
+      
+      for (const file of files) {
         try {
-          await fs.unlink(filePath);
+          const filePath = path.join(uploadsDir, file);
+          const stats = await fs.stat(filePath);
+          
+          if (stats.isFile()) {
+            fileCount++;
+            totalSize += stats.size;
+          }
         } catch (err) {
-          console.warn('⚠️ File already deleted:', metadata.fileName);
+          continue;
+        }
+      }
+    } catch (err) {
+      console.warn('Uploads directory not accessible:', err);
+    }
+
+    let databaseStatus = 'healthy';
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+    } catch (err) {
+      databaseStatus = 'unhealthy';
+    }
+
+    // Get actual document count from database
+    const documentsInDB = await prisma.document.count();
+    const activeDocuments = await prisma.document.count({
+      where: { status: 'ACTIVE' }
+    });
+
+    const recentErrors = await prisma.auditLog.findMany({
+      where: {
+        success: false,
+        createdAt: {
+          gte: new Date(Date.now() - 24 * 60 * 60 * 1000)
+        }
+      },
+      take: 5,
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const errors = recentErrors.map(log => ({
+      time: log.createdAt,
+      action: log.action,
+      details: log.details
+    }));
+
+    // Format uptime
+    const uptimeSeconds = Math.floor(process.uptime());
+    const hours = Math.floor(uptimeSeconds / 3600);
+    const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+    const seconds = uptimeSeconds % 60;
+    const formattedUptime = `${hours}h ${minutes}m ${seconds}s`;
+
+    return {
+      database: databaseStatus,
+      storage: {
+        filesOnDisk: fileCount,
+        totalSize: `${(totalSize / 1024 / 1024).toFixed(2)} MB`,
+        documentsInDB,
+        activeDocuments
+      },
+      uptime: formattedUptime,
+      errors
+    };
+  });
+
+  fastify.post('/bulk-upload', {
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
+  }, async (request, reply) => {
+    const data = await request.file();
+    
+    if (!data) {
+      return reply.code(400).send({ error: 'No file uploaded' });
+    }
+
+    try {
+      const buffer = await data.toBuffer();
+      const csvContent = buffer.toString('utf-8');
+      
+      const records = parse(csvContent, {
+        columns: true,
+        skip_empty_lines: true
+      });
+
+      let successful = 0;
+      let failed = 0;
+      const errors: any[] = [];
+
+      for (const record of records) {
+        try {
+          const { email, role, institutionId } = record;
+
+          if (!email || !role || !institutionId) {
+            throw new Error('Missing required fields');
+          }
+
+          const existing = await prisma.user.findUnique({
+            where: { email }
+          });
+
+          if (existing) {
+            throw new Error('User already exists');
+          }
+
+          await prisma.user.create({
+            data: {
+              id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              email,
+              role,
+              institutionId,
+              verified: true,
+              whitelistedAt: new Date()
+            }
+          });
+
+          successful++;
+        } catch (err: any) {
+          failed++;
+          errors.push({
+            email: record.email,
+            error: err.message
+          });
         }
       }
 
-      // Delete user (cascade will handle documents, OTP codes, audit logs)
-      await prisma.user.delete({ where: { id } });
-
-      // Log audit
-      await prisma.auditLog.create({
-        data: {
-          userId: adminUser.userId,
-          action: 'user_delete',
-          resource: 'User',
-          resourceId: id,
-          details: { email: user.email, role: user.role },
-          success: true
-        }
-      });
-
-      console.log('✅ Admin deleted user:', user.email);
-
-      return { message: 'User deleted successfully' };
-    } catch (error: any) {
-      console.error('❌ Admin user delete error:', error);
-      return reply.code(500).send({ error: error.message });
+      return {
+        total: records.length,
+        successful,
+        failed,
+        errors
+      };
+    } catch (err: any) {
+      return reply.code(500).send({ error: 'Failed to process CSV: ' + err.message });
     }
   });
 
-  // Delete institution
-  fastify.delete('/institutions/:id', {
-    onRequest: [fastify.authenticate, requireAdmin]
+  fastify.delete('/users/:id', {
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
   }, async (request, reply) => {
     const { id } = request.params as any;
-    const adminUser = request.user as any;
+
+    try {
+      const user = request.user as any;
+      if (user.userId === id) {
+        return reply.code(400).send({ error: 'Cannot delete your own account' });
+      }
+
+      await prisma.user.delete({
+        where: { id }
+      });
+
+      return { message: 'User deleted successfully' };
+    } catch (err: any) {
+      return reply.code(500).send({ error: 'Failed to delete user: ' + err.message });
+    }
+  });
+
+  fastify.delete('/documents/:id', {
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
+  }, async (request, reply) => {
+    const { id } = request.params as any;
+
+    try {
+      const document = await prisma.document.findUnique({
+        where: { id }
+      });
+
+      if (!document) {
+        return reply.code(404).send({ error: 'Document not found' });
+      }
+
+      const metadata = document.metadata as any;
+      if (metadata.filePath) {
+        try {
+          await fs.unlink(metadata.filePath);
+        } catch (err) {
+          console.warn('Failed to delete file:', err);
+        }
+      }
+
+      await prisma.document.delete({
+        where: { id }
+      });
+
+      return { message: 'Document deleted successfully' };
+    } catch (err: any) {
+      return reply.code(500).send({ error: 'Failed to delete document: ' + err.message });
+    }
+  });
+
+  fastify.delete('/institutions/:id', {
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
+  }, async (request, reply) => {
+    const { id } = request.params as any;
 
     try {
       const institution = await prisma.institution.findUnique({
@@ -210,217 +321,82 @@ export async function adminRoutes(fastify: FastifyInstance) {
         return reply.code(404).send({ error: 'Institution not found' });
       }
 
-      // Check if admin belongs to this institution
-      const admin = await prisma.user.findUnique({
-        where: { id: adminUser.userId }
-      });
-
-      if (admin?.institutionId === id) {
-        return reply.code(400).send({ error: 'Cannot delete your own institution' });
-      }
-
-      // Delete all document files
       for (const doc of institution.documents) {
         const metadata = doc.metadata as any;
-        const filePath = path.join(process.cwd(), 'uploads', metadata.fileName);
-        
-        try {
-          await fs.unlink(filePath);
-        } catch (err) {
-          console.warn('⚠️ File already deleted:', metadata.fileName);
+        if (metadata.filePath) {
+          try {
+            await fs.unlink(metadata.filePath);
+          } catch (err) {
+            console.warn('Failed to delete file:', err);
+          }
         }
       }
 
-      // Delete institution (cascade will handle users, documents, revocations)
-      await prisma.institution.delete({ where: { id } });
-
-      // Log audit
-      await prisma.auditLog.create({
-        data: {
-          userId: adminUser.userId,
-          action: 'institution_delete',
-          resource: 'Institution',
-          resourceId: id,
-          details: { 
-            name: institution.name, 
-            userCount: institution.users.length,
-            documentCount: institution.documents.length 
-          },
-          success: true
-        }
-      });
-
-      console.log('✅ Admin deleted institution:', institution.name);
-
-      return { message: 'Institution deleted successfully' };
-    } catch (error: any) {
-      console.error('❌ Admin institution delete error:', error);
-      return reply.code(500).send({ error: error.message });
-    }
-  });
-
-  // Delete document
-  fastify.delete('/documents/:id', {
-    onRequest: [fastify.authenticate, requireAdmin]
-  }, async (request, reply) => {
-    const { id } = request.params as any;
-    const user = request.user as any;
-
-    try {
-      const document = await prisma.document.findUnique({
+      await prisma.institution.delete({
         where: { id }
       });
 
-      if (!document) {
-        return reply.code(404).send({ error: 'Document not found' });
-      }
-
-      const metadata = document.metadata as any;
-      const filePath = path.join(process.cwd(), 'uploads', metadata.fileName);
-      
-      try {
-        await fs.unlink(filePath);
-        console.log('🗑️ Admin deleted file:', metadata.fileName);
-      } catch (err) {
-        console.warn('⚠️ File already deleted:', metadata.fileName);
-      }
-
-      await prisma.document.delete({ where: { id } });
-
-      // Log audit
-      await prisma.auditLog.create({
-        data: {
-          userId: user.userId,
-          action: 'document_delete',
-          resource: 'Document',
-          resourceId: id,
-          details: { documentType: document.type, reason: 'admin_action' },
-          success: true
-        }
-      });
-
-      console.log('✅ Admin deleted document:', id);
-
-      return { message: 'Document deleted successfully' };
-    } catch (error: any) {
-      console.error('❌ Admin delete error:', error);
-      return reply.code(500).send({ error: error.message });
+      return { 
+        message: 'Institution deleted successfully',
+        deletedUsers: institution.users.length,
+        deletedDocuments: institution.documents.length
+      };
+    } catch (err: any) {
+      return reply.code(500).send({ error: 'Failed to delete institution: ' + err.message });
     }
   });
-
-  // Bulk upload via CSV
-  fastify.post('/bulk-upload', {
-    onRequest: [fastify.authenticate, requireAdmin]
+// Cleanup orphaned files
+  fastify.post('/cleanup-files', {
+    onRequest: [fastify.authenticate, fastify.requireAdmin]
   }, async (request, reply) => {
     const user = request.user as any;
 
     try {
-      const data = await request.file();
-      if (!data) {
-        return reply.code(400).send({ error: 'No file uploaded' });
-      }
-
-      const buffer = await data.toBuffer();
-      const csvText = buffer.toString('utf-8');
-
-      const parsed = Papa.parse(csvText, {
-        header: true,
-        skipEmptyLines: true
+      const uploadsDir = path.join(process.cwd(), 'uploads');
+      
+      const documents = await prisma.document.findMany({
+        select: { metadata: true }
       });
 
-      const results = {
-        total: 0,
-        created: 0,
-        failed: 0,
-        errors: [] as any[]
-      };
+      const dbFilePaths = new Set(
+        documents.map((doc: any) => doc.metadata.filePath).filter(Boolean)
+      );
 
-      for (const row of parsed.data as any[]) {
-        results.total++;
+      const files = await fs.readdir(uploadsDir).catch(() => []);
+      const beforeCount = files.length;
+
+      let orphanedCount = 0;
+
+      for (const file of files) {
+        const filePath = path.join(uploadsDir, file);
         
-        try {
-          const { email, role, institutionName } = row;
-
-          if (!email || !role || !institutionName) {
-            results.failed++;
-            results.errors.push({ row, error: 'Missing required fields' });
-            continue;
-          }
-
-          const institution = await prisma.institution.findFirst({
-            where: { name: institutionName }
-          });
-
-          if (!institution) {
-            results.failed++;
-            results.errors.push({ row, error: `Institution not found: ${institutionName}` });
-            continue;
-          }
-
-          await prisma.user.upsert({
-            where: { email },
-            create: {
-              email,
-              institutionId: institution.id,
-              role: role.toUpperCase(),
-              verified: true
-            },
-            update: {
-              role: role.toUpperCase()
-            }
-          });
-
-          results.created++;
-        } catch (err: any) {
-          results.failed++;
-          results.errors.push({ row, error: err.message });
+        if (!dbFilePaths.has(filePath)) {
+          await fs.unlink(filePath);
+          orphanedCount++;
         }
       }
 
-      // Log audit
       await prisma.auditLog.create({
         data: {
           userId: user.userId,
-          action: 'bulk_upload',
-          resource: 'User',
-          details: results,
+          action: 'files_cleanup',
+          resource: 'System',
+          details: { orphanedCount, beforeCount, afterCount: beforeCount - orphanedCount },
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
           success: true
         }
-      });
+      }).catch(() => {});
 
-      return results;
+      return {
+        success: true,
+        orphanedCount,
+        beforeCount,
+        afterCount: beforeCount - orphanedCount,
+        message: `Cleaned up ${orphanedCount} orphaned file(s)`
+      };
     } catch (error: any) {
-      fastify.log.error(error);
-      return reply.code(500).send({ error: error.message });
+      return reply.code(500).send({ error: 'Cleanup failed: ' + error.message });
     }
-  });
-
-  // System health check
-  fastify.get('/health', {
-    onRequest: [fastify.authenticate, requireAdmin]
-  }, async () => {
-    const [dbStatus, uploadsCount, recentErrors] = await Promise.all([
-      prisma.$queryRaw`SELECT 1`
-        .then(() => 'healthy')
-        .catch(() => 'unhealthy'),
-      fs.readdir(path.join(process.cwd(), 'uploads'))
-        .then(files => files.length)
-        .catch(() => 0),
-      prisma.auditLog.count({
-        where: {
-          success: false,
-          createdAt: {
-            gte: new Date(Date.now() - 60 * 60 * 1000)
-          }
-        }
-      })
-    ]);
-
-    return {
-      database: dbStatus,
-      uploads: uploadsCount,
-      errors: recentErrors,
-      timestamp: new Date().toISOString()
-    };
   });
 }

@@ -1,0 +1,96 @@
+Find this section in src/routes/documents.ts (around line 200-250):
+
+  // Verify document
+  fastify.post('/:id/verify', {
+
+And replace the ENTIRE verify endpoint with this:
+
+  // Verify document
+  fastify.post('/:id/verify', {
+    onRequest: [fastify.authenticate]
+  }, async (request, reply) => {
+    const { id } = request.params as any;
+
+    const document = await prisma.document.findUnique({
+      where: { id },
+      include: {
+        institution: true,
+        user: true
+      }
+    });
+
+    if (!document) {
+      return reply.code(404).send({ error: 'Document not found' });
+    }
+
+    const metadata = document.metadata as any;
+
+    try {
+      const checks = {
+        signatureValid: false,
+        authorityValid: false,
+        notRevoked: false
+      };
+
+      // Load revocation record
+      const revocation = await prisma.revocation.findUnique({
+        where: { documentId: document.id }
+      });
+
+      // Check revocation FIRST
+      if (document.status === 'REVOKED' || revocation) {
+        console.log('Document is REVOKED, returning revocation details:', {
+          revokedAt: revocation?.revokedAt,
+          revokedBy: revocation?.revokedBy,
+          reason: revocation?.reason
+        });
+        
+        return reply.send({
+          valid: false,
+          status: 'REVOKED',
+          revokedAt: revocation?.revokedAt,
+          revokedBy: revocation?.revokedBy,
+          reason: revocation?.reason,
+          checks,
+          errors: ['Document has been revoked and is no longer valid']
+        });
+      }
+
+      if (document.status === 'SUPERSEDED') {
+        return reply.send({
+          valid: false,
+          status: 'SUPERSEDED',
+          checks,
+          errors: ['Document has been superseded by a newer version']
+        });
+      }
+
+      checks.notRevoked = true;
+
+      const fileBuffer = await fs.readFile(metadata.filePath);
+
+      const isSignatureValid = KeyManagementService.verifyDocument(
+        fileBuffer,
+        metadata.signature,
+        document.institution.rootPublicKey,
+        metadata.hash
+      );
+
+      checks.signatureValid = isSignatureValid;
+      checks.authorityValid = document.institution.status === 'ACTIVE';
+
+      const valid = checks.signatureValid && checks.authorityValid && checks.notRevoked;
+
+      return reply.send({
+        valid,
+        status: document.status,
+        checks
+      });
+    } catch (error: any) {
+      fastify.log.error(error);
+      return reply.code(500).send({ 
+        error: 'Verification failed: ' + error.message,
+        valid: false
+      });
+    }
+  });

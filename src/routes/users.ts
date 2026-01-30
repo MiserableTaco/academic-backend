@@ -1,28 +1,56 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../lib/prisma.js';
-import { requireIssuerOrAdmin } from '../middleware/roleCheck.js';
 
 export async function userRoutes(fastify: FastifyInstance) {
-  // Get students from same institution
   fastify.get('/students', {
-    onRequest: [fastify.authenticate, requireIssuerOrAdmin]
+    onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
   }, async (request) => {
     const user = request.user as any;
-    
-    const students = await prisma.user.findMany({
-      where: {
-        institutionId: user.institutionId,
-        role: 'STUDENT',
-        revokedAt: null
-      },
-      select: {
-        id: true,
-        email: true
-      },
-      orderBy: {
-        email: 'asc'
-      }
-    });
+
+    let students;
+
+    if (user.role === 'ADMIN') {
+      // ADMIN sees ALL students (no verified filter)
+      students = await prisma.user.findMany({
+        where: {
+          role: 'STUDENT'
+          // No verified filter for admin
+        },
+        select: {
+          id: true,
+          email: true,
+          verified: true,
+          institutionId: true,
+          institution: {
+            select: {
+              name: true
+            }
+          }
+        },
+        orderBy: { email: 'asc' }
+      });
+    } else {
+      // ISSUER sees only verified students in their institution
+      students = await prisma.user.findMany({
+        where: {
+          role: 'STUDENT',
+          verified: true,
+          institutionId: user.institutionId
+        },
+        select: {
+          id: true,
+          email: true,
+          verified: true,
+          institutionId: true,
+          institution: {
+            select: {
+              name: true
+            }
+          }
+        },
+        orderBy: { email: 'asc' }
+      });
+    }
 
     return { students };
   });
