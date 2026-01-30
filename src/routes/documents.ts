@@ -2,10 +2,21 @@ import { FastifyInstance } from 'fastify';
 import { prisma } from '../lib/prisma.js';
 import { KeyManagementService } from '../services/key-management.service.js';
 import { PDFSecurityService } from '../services/pdf-security.service.js';
+import { PDFDocument } from 'pdf-lib';
 import fs from 'fs/promises';
 import path from 'path';
 
 export async function documentRoutes(fastify: FastifyInstance) {
+  
+  // Helper: Redact email for privacy
+  const redactEmail = (email: string): string => {
+    const [name, domain] = email.split('@');
+    if (name.length <= 2) {
+      return `${name[0]}***@${domain}`;
+    }
+    return `${name[0]}***${name[name.length - 1]}@${domain}`;
+  };
+
   // Upload single document
   fastify.post('/upload', {
     onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
@@ -59,7 +70,7 @@ export async function documentRoutes(fastify: FastifyInstance) {
         return reply.code(404).send({ error: 'Institution not found' });
       }
 
-      // Handle supersede - mark old document as SUPERSEDED
+      // Handle supersede
       if (supersede) {
         await prisma.document.updateMany({
           where: {
@@ -81,9 +92,18 @@ export async function documentRoutes(fastify: FastifyInstance) {
       const uniqueFilename = `${timestamp}_${sanitizedFilename}`;
       const filePath = path.join(uploadsDir, uniqueFilename);
       
-      await fs.writeFile(filePath, buffer);
-
-      const hash = KeyManagementService.hashDocument(buffer);
+      const documentId = `doc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      const pdfDoc = await PDFDocument.load(buffer);
+      pdfDoc.setSubject(documentId);
+      pdfDoc.setCreator(institution.id);
+      pdfDoc.setProducer('AcadCert v1.0');
+      pdfDoc.setTitle(documentType);
+      
+      const finalPdfBytes = await pdfDoc.save();
+      await fs.writeFile(filePath, finalPdfBytes);
+      
+      const hash = KeyManagementService.hashDocument(Buffer.from(finalPdfBytes));
       const signature = KeyManagementService.signDocument(
         hash,
         institution.rootPrivateKey,
@@ -92,7 +112,7 @@ export async function documentRoutes(fastify: FastifyInstance) {
 
       const document = await prisma.document.create({
         data: {
-          id: `doc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          id: documentId,
           type: documentType,
           userId: recipient.id,
           institutionId: institution.id,
@@ -106,7 +126,7 @@ export async function documentRoutes(fastify: FastifyInstance) {
             filePath,
             originalName: data.filename,
             sanitizedName: sanitizedFilename,
-            fileSize: buffer.length,
+            fileSize: finalPdfBytes.length,
             mimeType: data.mimetype,
             issuerEmail: user.email,
             issuerId: user.userId
@@ -250,7 +270,164 @@ export async function documentRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // Verify document
+  // ========================================
+  // PUBLIC VERIFY ENDPOINT - SECURED
+  // ========================================
+  fastify.get('/:id/verify-public', {
+    config: {
+      rateLimit: {
+        max: 10,
+        timeWindow: '1 minute',
+        errorResponseBuilder: () => ({
+          error: 'Rate limit exceeded',
+          message: 'Too many verification requests. Please try again in 1 minute.',
+          retryAfter: 60
+        })
+      }
+    }
+  }, async (request, reply) => {
+    const { id } = request.params as any;
+    const clientIp = request.ip;
+
+    try {
+      const document = await prisma.document.findUnique({
+        where: { id },
+        include: { 
+          institution: {
+            select: {
+              id: true,
+              name: true,
+              status: true,
+              rootPublicKey: true
+            }
+          },
+          user: {
+            select: {
+              id: true,
+              email: true
+            }
+          }
+        }
+      });
+
+      // Audit log - track ALL attempts
+      await prisma.auditLog.create({
+        data: {
+          action: 'public_verification_attempt',
+          resource: 'Document',
+          details: {
+            documentId: id,
+            found: !!document,
+            status: document?.status || 'NOT_FOUND'
+          },
+          ipAddress: clientIp,
+          userAgent: request.headers['user-agent'] || 'Unknown',
+          success: !!document
+        }
+      }).catch((err) => {
+        fastify.log.error('Failed to create audit log:', err);
+      });
+
+      if (!document) {
+        return reply.code(404).send({ 
+          error: 'Document not found',
+          valid: false
+        });
+      }
+
+      const metadata = document.metadata as any;
+
+      const checks = {
+        signatureValid: false,
+        authorityValid: false,
+        notRevoked: false
+      };
+
+      // Check revocation
+      const revocation = await prisma.revocation.findFirst({
+        where: { documentId: document.id }
+      });
+
+      if (document.status === 'REVOKED' || revocation) {
+        return {
+          valid: false,
+          status: 'REVOKED',
+          revokedAt: revocation?.revokedAt || null,
+          revokedBy: revocation?.revokedBy || 'Unknown',
+          reason: revocation?.reason || 'No reason provided',
+          checks,
+          document: {
+            type: document.type,
+            issuedAt: document.issuedAt,
+            recipientEmail: redactEmail(document.user.email)  // REDACTED
+          },
+          institution: {
+            name: document.institution.name
+          }
+        };
+      }
+
+      if (document.status === 'SUPERSEDED') {
+        return {
+          valid: false,
+          status: 'SUPERSEDED',
+          checks,
+          document: {
+            type: document.type,
+            issuedAt: document.issuedAt,
+            recipientEmail: redactEmail(document.user.email)  // REDACTED
+          },
+          institution: {
+            name: document.institution.name
+          }
+        };
+      }
+
+      checks.notRevoked = true;
+
+      // Verify signature
+      try {
+        const fileBuffer = await fs.readFile(metadata.filePath);
+
+        const isSignatureValid = KeyManagementService.verifyDocument(
+          fileBuffer,
+          metadata.signature,
+          document.institution.rootPublicKey,
+          metadata.hash
+        );
+
+        checks.signatureValid = isSignatureValid;
+      } catch (error) {
+        fastify.log.error('Signature verification error:', error);
+        checks.signatureValid = false;
+      }
+
+      checks.authorityValid = document.institution.status === 'ACTIVE';
+
+      return {
+        valid: checks.signatureValid && checks.authorityValid && checks.notRevoked,
+        status: document.status,
+        checks,
+        document: {
+          type: document.type,
+          issuedAt: document.issuedAt,
+          recipientEmail: redactEmail(document.user.email)  // REDACTED
+        },
+        institution: {
+          name: document.institution.name,
+          status: document.institution.status
+        }
+      };
+    } catch (error: any) {
+      fastify.log.error('Public verification error:', error);
+      return reply.code(500).send({ 
+        error: 'Verification failed',
+        valid: false
+      });
+    }
+  });
+
+  // Verify document (authenticated)
   fastify.post('/:id/verify', {
     onRequest: [fastify.authenticate]
   }, async (request, reply) => {
@@ -274,14 +451,9 @@ export async function documentRoutes(fastify: FastifyInstance) {
         notRevoked: false
       };
 
-      // Check revocation FIRST
-      console.log('🔍 Checking revocation for documentId:', document.id);
-      
       const revocation = await prisma.revocation.findFirst({
         where: { documentId: document.id }
       });
-
-      console.log('📋 Revocation found:', JSON.stringify(revocation, null, 2));
 
       if (document.status === 'REVOKED' || revocation) {
         return {
@@ -337,7 +509,7 @@ export async function documentRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // NEW: Revoke document
+  // Revoke document
   fastify.post('/:id/revoke', {
     onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
   }, async (request, reply) => {
@@ -358,7 +530,6 @@ export async function documentRoutes(fastify: FastifyInstance) {
       return reply.code(404).send({ error: 'Document not found' });
     }
 
-    // Permission check: Admin can revoke anything, Issuer only from their institution
     if (user.role === 'ISSUER' && document.institutionId !== user.institutionId) {
       return reply.code(403).send({ error: 'Cannot revoke documents from other institutions' });
     }
@@ -367,13 +538,11 @@ export async function documentRoutes(fastify: FastifyInstance) {
       return reply.code(400).send({ error: 'Document is already revoked' });
     }
 
-    // Update document status
     await prisma.document.update({
       where: { id },
       data: { status: 'REVOKED' }
     });
 
-    // Create revocation record
     await prisma.revocation.create({
       data: {
         id: `rev_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -385,7 +554,6 @@ export async function documentRoutes(fastify: FastifyInstance) {
       }
     });
 
-    // Audit log
     await prisma.auditLog.create({
       data: {
         userId: user.userId,
@@ -455,7 +623,7 @@ export async function documentRoutes(fastify: FastifyInstance) {
     return { message: 'Document deleted successfully' };
   });
 
-  // Smart table bulk upload (keep existing implementation)
+  // Smart table bulk upload
   fastify.post('/bulk-upload-smart', {
     onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
   }, async (request, reply) => {
