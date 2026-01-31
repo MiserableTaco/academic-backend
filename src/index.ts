@@ -15,13 +15,14 @@ const fastify = Fastify({
   logger: true
 });
 
-// DEPLOYMENT FIX: Dynamic CORS for dev and production
+// DEPLOYMENT: Dynamic CORS for dev and production
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:3001',
-  process.env.FRONTEND_URL, // Netlify URL
-  process.env.VERICERT_URL   // VeriCert frontend URL
-].filter(Boolean); // Remove undefined values
+  'http://localhost:3002', // VeriCert local
+  process.env.FRONTEND_URL, // Netlify AcadCert URL
+  process.env.VERICERT_URL   // Netlify VeriCert URL
+].filter(Boolean);
 
 await fastify.register(cors, {
   origin: (origin, cb) => {
@@ -50,17 +51,30 @@ await fastify.register(multipart, {
   }
 });
 
+// FIX: Cookie configuration for cross-origin (Netlify → Railway)
 await fastify.register(cookie, {
-  secret: process.env.COOKIE_SECRET || 'your-cookie-secret-min-32-chars-long-change-in-production',
-  hook: 'onRequest'
+  secret: process.env.COOKIE_SECRET || '0c+d1OYo9NSEISl8PMDhIT9RLMJ850Fr6RlEQ/TFo3EwlHXMr8rNyPTTrXgaH2Kd/hYR2R7tenNrEyQyAKG9Gg==', // ← REPLACE WITH CRYPTO SECRET IN RAILWAY
+  hook: 'onRequest',
+  parseOptions: {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production', // Only HTTPS in production
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // CRITICAL: Allow cross-origin in production
+    path: '/'
+  }
 });
 
+// CSRF protection (uses signed cookies)
 await fastify.register(csrf, {
-  cookieOpts: { signed: true }
+  cookieOpts: { 
+    signed: true,
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
+  }
 });
 
 await fastify.register(jwt, {
-  secret: process.env.JWT_SECRET || 'your-secret-key-change-this-in-production'
+  secret: process.env.JWT_SECRET || '2pvM0+Gg5yeR2NwQHLnXEAA+SZ8qqTdwJBKbetTjaKrkGaPVRh8WCOu5fZesXlbKOUrNhQ4+MF8xOCEeq4wocg==' // ← REPLACE WITH CRYPTO SECRET IN RAILWAY
 });
 
 await fastify.register(rateLimit, {
@@ -69,6 +83,7 @@ await fastify.register(rateLimit, {
   timeWindow: '15 minutes'
 });
 
+// Authentication decorator
 fastify.decorate('authenticate', async function(request: any, reply: any) {
   try {
     const token = request.cookies.token || request.headers.authorization?.replace('Bearer ', '');
@@ -84,6 +99,7 @@ fastify.decorate('authenticate', async function(request: any, reply: any) {
   }
 });
 
+// Role-based authorization decorators
 fastify.decorate('requireAdmin', async function(request: any, reply: any) {
   if (request.user.role !== 'ADMIN') {
     return reply.code(403).send({ error: 'Admin access required' });
@@ -96,20 +112,24 @@ fastify.decorate('requireIssuerOrAdmin', async function(request: any, reply: any
   }
 });
 
+// Health check endpoint
 fastify.get('/health', async () => {
   return { status: 'ok', timestamp: new Date().toISOString() };
 });
 
+// CSRF token endpoint
 fastify.get('/api/csrf-token', async (request, reply) => {
   const token = await reply.generateCsrf();
   return { csrfToken: token };
 });
 
+// Register routes
 await fastify.register(authRoutes, { prefix: '/api/auth' });
 await fastify.register(documentRoutes, { prefix: '/api/documents' });
 await fastify.register(userRoutes, { prefix: '/api/users' });
 await fastify.register(adminRoutes, { prefix: '/api/admin' });
 
+// Start server
 const start = async () => {
   try {
     const port = Number(process.env.PORT) || 3000;
@@ -121,6 +141,7 @@ const start = async () => {
     console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`✅ CORS enabled for: ${allowedOrigins.join(', ')}`);
     console.log(`🔒 Security: Rate limiting, CSRF, httpOnly cookies enabled`);
+    console.log(`🍪 Cookie SameSite: ${process.env.NODE_ENV === 'production' ? 'none (cross-origin)' : 'lax (local)'}`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

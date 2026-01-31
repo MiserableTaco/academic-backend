@@ -161,12 +161,11 @@ export async function authRoutes(fastify: FastifyInstance) {
       });
 
       reply.setCookie('token', token, {
-        path: '/',
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: 60 * 60 * 24 * 7,
-        domain: undefined
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+        maxAge: 7 * 24 * 60 * 60,
+        path: '/
       });
 
       await prisma.auditLog.create({
