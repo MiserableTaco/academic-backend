@@ -15,9 +15,30 @@ const fastify = Fastify({
   logger: true
 });
 
-// FIXED: Allow DELETE, PUT, PATCH methods
+// DEPLOYMENT FIX: Dynamic CORS for dev and production
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  process.env.FRONTEND_URL, // Netlify URL
+  process.env.VERICERT_URL   // VeriCert frontend URL
+].filter(Boolean); // Remove undefined values
+
 await fastify.register(cors, {
-  origin: ['http://localhost:3001', 'http://localhost:3000'],
+  origin: (origin, cb) => {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) {
+      cb(null, true);
+      return;
+    }
+    
+    // Check if origin is allowed
+    if (allowedOrigins.some(allowed => origin.startsWith(allowed))) {
+      cb(null, true);
+      return;
+    }
+    
+    cb(new Error('Not allowed by CORS'), false);
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-csrf-token']
@@ -76,7 +97,7 @@ fastify.decorate('requireIssuerOrAdmin', async function(request: any, reply: any
 });
 
 fastify.get('/health', async () => {
-  return { status: 'ok' };
+  return { status: 'ok', timestamp: new Date().toISOString() };
 });
 
 fastify.get('/api/csrf-token', async (request, reply) => {
@@ -91,10 +112,15 @@ await fastify.register(adminRoutes, { prefix: '/api/admin' });
 
 const start = async () => {
   try {
-    await fastify.listen({ port: 3000, host: '0.0.0.0' });
-    console.log('🚀 Server running on http://localhost:3000');
-    console.log('✅ CORS enabled for http://localhost:3001');
-    console.log('🔒 Security: Rate limiting, CSRF, httpOnly cookies enabled');
+    const port = Number(process.env.PORT) || 3000;
+    const host = process.env.HOST || '0.0.0.0';
+    
+    await fastify.listen({ port, host });
+    
+    console.log(`🚀 Server running on ${host}:${port}`);
+    console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`✅ CORS enabled for: ${allowedOrigins.join(', ')}`);
+    console.log(`🔒 Security: Rate limiting, CSRF, httpOnly cookies enabled`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
