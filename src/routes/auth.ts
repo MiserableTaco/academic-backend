@@ -1,6 +1,12 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../lib/prisma.js';
 import { EmailService } from '../services/email.service.js';
+import { 
+  RequestOTPSchema, 
+  VerifyOTPSchema, 
+  validateBody,
+  RATE_LIMITS
+} from '../lib/validation-schemas.js';
 import crypto from 'crypto';
 
 export async function authRoutes(fastify: FastifyInstance) {
@@ -13,21 +19,16 @@ export async function authRoutes(fastify: FastifyInstance) {
     return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
   }
 
+  // SECURITY FIX: Reduced from 50 to 5 requests per 15 minutes
   fastify.post('/request-otp', {
     config: {
-      rateLimit: {
-        max: 50,
-        timeWindow: '15 minutes'
-      }
+      rateLimit: RATE_LIMITS.OTP_REQUEST
     }
   }, async (request, reply) => {
-    const { email } = request.body as any;
-
-    if (!email) {
-      return reply.code(400).send({ error: 'Email is required' });
-    }
-
     try {
+      // SECURITY FIX: Validate input with Zod
+      const { email } = validateBody(RequestOTPSchema, request.body);
+
       const user = await prisma.user.findUnique({
         where: { email }
       });
@@ -62,25 +63,23 @@ export async function authRoutes(fastify: FastifyInstance) {
       return { message: 'If the email exists, an OTP has been sent.' };
     } catch (error: any) {
       fastify.log.error(error);
+      
+      if (error.name === 'ZodError') {
+        return reply.code(400).send({ error: 'Invalid email format' });
+      }
+      
       return reply.code(500).send({ error: 'An error occurred. Please try again.' });
     }
   });
 
   fastify.post('/verify-otp', {
     config: {
-      rateLimit: {
-        max: 50,
-        timeWindow: '15 minutes'
-      }
+      rateLimit: RATE_LIMITS.OTP_VERIFY
     }
   }, async (request, reply) => {
-    const { email, code } = request.body as any;
-
-    if (!email || !code) {
-      return reply.code(400).send({ error: 'Email and code are required' });
-    }
-
     try {
+      const { email, code } = validateBody(VerifyOTPSchema, request.body);
+
       const user = await prisma.user.findUnique({
         where: { email },
         include: {
@@ -161,14 +160,13 @@ export async function authRoutes(fastify: FastifyInstance) {
         institutionId: user.institutionId
       });
 
-      // CRITICAL: Explicitly set path to root
       reply.setCookie('token', token, {
-        path: '/',  // Must be root, not /api
+        path: '/',
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'lax',
         maxAge: 60 * 60 * 24 * 7,
-        domain: undefined  // Don't set domain (defaults to current)
+        domain: undefined
       });
 
       await prisma.auditLog.create({
@@ -196,6 +194,11 @@ export async function authRoutes(fastify: FastifyInstance) {
       };
     } catch (error: any) {
       fastify.log.error(error);
+      
+      if (error.name === 'ZodError') {
+        return reply.code(400).send({ error: 'Invalid code format' });
+      }
+      
       return reply.code(500).send({ error: 'An error occurred. Please try again.' });
     }
   });
@@ -217,7 +220,6 @@ export async function authRoutes(fastify: FastifyInstance) {
       }
     }).catch(() => {});
 
-    // CRITICAL: Clear cookie with same path
     reply.clearCookie('token', { 
       path: '/',
       domain: undefined 

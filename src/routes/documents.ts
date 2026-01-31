@@ -5,6 +5,7 @@ import { PDFSecurityService } from '../services/pdf-security.service.js';
 import { PDFDocument } from 'pdf-lib';
 import fs from 'fs/promises';
 import path from 'path';
+import { RATE_LIMITS } from '../lib/validation-schemas.js';
 
 export async function documentRoutes(fastify: FastifyInstance) {
   
@@ -18,8 +19,9 @@ export async function documentRoutes(fastify: FastifyInstance) {
   };
 
   // Upload single document
-  fastify.post('/upload', {
-    onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
+fastify.post('/upload', {
+    onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin],
+    config: { rateLimit: RATE_LIMITS.DOCUMENT_UPLOAD }
   }, async (request, reply) => {
     const user = request.user as any;
 

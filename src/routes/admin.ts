@@ -1,12 +1,15 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../lib/prisma.js';
+import { BulkUploadSchema, validateBody, safeValidate, MAX_CSV_SIZE, RATE_LIMITS } from '../lib/validation-schemas.js';
 import fs from 'fs/promises';
 import path from 'path';
 import { parse } from 'csv-parse/sync';
 
 export async function adminRoutes(fastify: FastifyInstance) {
+
   fastify.get('/stats', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_READ }
   }, async () => {
     const [users, documents, institutions, recentAudits] = await Promise.all([
       prisma.user.count(),
@@ -30,7 +33,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
  });
 
   fastify.get('/users', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_READ }
   }, async () => {
     const users = await prisma.user.findMany({
       include: {
@@ -43,7 +47,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get('/documents', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_READ }
   }, async () => {
     const documents = await prisma.document.findMany({
       include: {
@@ -57,7 +62,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get('/institutions', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_READ }
   }, async () => {
     const institutions = await prisma.institution.findMany({
       orderBy: { createdAt: 'desc' }
@@ -67,7 +73,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get('/audit-logs', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_READ }
   }, async () => {
     const logs = await prisma.auditLog.findMany({
       include: {
@@ -81,7 +88,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get('/security-events', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_READ }
   }, async () => {
     const events = await prisma.auditLog.findMany({
       where: {
@@ -101,7 +109,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get('/health', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_READ }
   }, async () => {
     const uploadsDir = path.join(process.cwd(), 'uploads');
     
@@ -136,7 +145,6 @@ export async function adminRoutes(fastify: FastifyInstance) {
       databaseStatus = 'unhealthy';
     }
 
-    // Get actual document count from database
     const documentsInDB = await prisma.document.count();
     const activeDocuments = await prisma.document.count({
       where: { status: 'ACTIVE' }
@@ -159,7 +167,6 @@ export async function adminRoutes(fastify: FastifyInstance) {
       details: log.details
     }));
 
-    // Format uptime
     const uptimeSeconds = Math.floor(process.uptime());
     const hours = Math.floor(uptimeSeconds / 3600);
     const minutes = Math.floor((uptimeSeconds % 3600) / 60);
@@ -179,8 +186,10 @@ export async function adminRoutes(fastify: FastifyInstance) {
     };
   });
 
+  // SECURITY FIX: Stricter rate limit + file size check
   fastify.post('/bulk-upload', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_WRITE }
   }, async (request, reply) => {
     const data = await request.file();
     
@@ -190,6 +199,12 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
     try {
       const buffer = await data.toBuffer();
+      
+      // SECURITY FIX: Check CSV size
+      if (buffer.length > MAX_CSV_SIZE) {
+        return reply.code(400).send({ error: 'CSV file too large. Maximum 5MB allowed.' });
+      }
+      
       const csvContent = buffer.toString('utf-8');
       
       const records = parse(csvContent, {
@@ -197,17 +212,25 @@ export async function adminRoutes(fastify: FastifyInstance) {
         skip_empty_lines: true
       });
 
+      // SECURITY FIX: Limit number of records
+      if (records.length > 1000) {
+        return reply.code(400).send({ error: 'Too many records. Maximum 1000 users per upload.' });
+      }
+
       let successful = 0;
       let failed = 0;
       const errors: any[] = [];
 
       for (const record of records) {
         try {
-          const { email, role, institutionId } = record;
-
-          if (!email || !role || !institutionId) {
-            throw new Error('Missing required fields');
+          // SECURITY FIX: Validate with Zod
+          const result = safeValidate(BulkUploadSchema, record);
+          
+          if (!result.success) {
+            throw new Error('Invalid data format');
           }
+
+          const { email, role, institutionId } = result.data;
 
           const existing = await prisma.user.findUnique({
             where: { email }
@@ -242,15 +265,16 @@ export async function adminRoutes(fastify: FastifyInstance) {
         total: records.length,
         successful,
         failed,
-        errors
+        errors: errors.slice(0, 10)
       };
     } catch (err: any) {
-      return reply.code(500).send({ error: 'Failed to process CSV: ' + err.message });
+      return reply.code(500).send({ error: 'Failed to process CSV file' });
     }
   });
 
   fastify.delete('/users/:id', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_DELETE }
   }, async (request, reply) => {
     const { id } = request.params as any;
 
@@ -266,12 +290,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
       return { message: 'User deleted successfully' };
     } catch (err: any) {
-      return reply.code(500).send({ error: 'Failed to delete user: ' + err.message });
+      return reply.code(500).send({ error: 'Failed to delete user' });
     }
   });
 
   fastify.delete('/documents/:id', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_DELETE }
   }, async (request, reply) => {
     const { id } = request.params as any;
 
@@ -299,12 +324,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
       return { message: 'Document deleted successfully' };
     } catch (err: any) {
-      return reply.code(500).send({ error: 'Failed to delete document: ' + err.message });
+      return reply.code(500).send({ error: 'Failed to delete document' });
     }
   });
 
   fastify.delete('/institutions/:id', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_DELETE }
   }, async (request, reply) => {
     const { id } = request.params as any;
 
@@ -342,12 +368,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
         deletedDocuments: institution.documents.length
       };
     } catch (err: any) {
-      return reply.code(500).send({ error: 'Failed to delete institution: ' + err.message });
+      return reply.code(500).send({ error: 'Failed to delete institution' });
     }
   });
-// Cleanup orphaned files
+
   fastify.post('/cleanup-files', {
-    onRequest: [fastify.authenticate, fastify.requireAdmin]
+    onRequest: [fastify.authenticate, fastify.requireAdmin],
+    config: { rateLimit: RATE_LIMITS.ADMIN_WRITE }
   }, async (request, reply) => {
     const user = request.user as any;
 
@@ -396,7 +423,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         message: `Cleaned up ${orphanedCount} orphaned file(s)`
       };
     } catch (error: any) {
-      return reply.code(500).send({ error: 'Cleanup failed: ' + error.message });
+      return reply.code(500).send({ error: 'Cleanup failed' });
     }
   });
 }

@@ -1,9 +1,12 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../lib/prisma.js';
+import { RATE_LIMITS } from '../lib/validation-schemas.js';
 
 export async function userRoutes(fastify: FastifyInstance) {
+  // SECURITY FIX: Add rate limiting
   fastify.get('/students', {
-    onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin]
+    onRequest: [fastify.authenticate, fastify.requireIssuerOrAdmin],
+    config: { rateLimit: RATE_LIMITS.USER_LIST }
   }, async (request) => {
     const user = request.user as any;
 
@@ -14,7 +17,6 @@ export async function userRoutes(fastify: FastifyInstance) {
       students = await prisma.user.findMany({
         where: {
           role: 'STUDENT'
-          // No verified filter for admin
         },
         select: {
           id: true,
